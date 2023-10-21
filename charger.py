@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-#
+
 import cv2
 import numpy as np
 import requests
@@ -11,9 +11,7 @@ import datetime
 
 
 def archive_current_log(log_file="charger.log"):
-    # Check if the log_file already exists
     if os.path.exists(log_file):
-        # Rename the current log file with the current timestamp
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         archived_log = f"{log_file}_{timestamp}.old"
         os.rename(log_file, archived_log)
@@ -32,73 +30,85 @@ def setup_logger(log_file="charger.log", log_level="INFO"):
     return logger
 
 
-def fetch_and_analyze_image(min_area, max_area, brightness_threshold, charging_lower_bound, charging_upper_bound):
+def fetch_and_analyze_image(image_url_str, min_area, max_area, brightness_threshold, charging_lower_bound, charging_upper_bound, aspect_ratio_range, morph_kernel_height,
+                            morph_kernel_width):
 
-    response = requests.get("http://192.168.200.22:8080/?action=snapshot")
-    response.raise_for_status()
+    try:
+        response = requests.get(image_url_str)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"Error fetching image: {e}")
+        return
+
     img_np_array = np.asarray(bytearray(response.content), dtype=np.uint8)
     img = cv2.imdecode(img_np_array, cv2.IMREAD_COLOR)
 
     height, width = img.shape[:2]
     crop_width = int(0.05 * width)
     img = img[:, :-crop_width]
+    logger.debug(f"The image has size x={width} y={height}")
+
+    # Increase the contrast of the image
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    img = cv2.cvtColor(limg, cv2.COLOR_Lab2BGR)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Apply Gaussian blur
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    avg_brightness = round(np.mean(blurred), 2)
-    logger.info(f"Garage Average Brightness: {avg_brightness}")
+    avg_brightness = round(np.mean(gray), 2)
+    logger.debug(f"Garage Average Brightness: {avg_brightness}")
 
     if avg_brightness < brightness_threshold:
-        logger.info(f"Garage door is closed")
-        logger.info(
-            f"Debug: avg_brightness={avg_brightness}, charging_lower_bound={charging_lower_bound}, charging_upper_bound={charging_upper_bound}")
+        cv2.imwrite("closed.jpg", gray)
         if charging_lower_bound <= avg_brightness < charging_upper_bound:
             logger.info(f"Garage Door Closed: State is Charging:")
         else:
-            logger.info(f"Garage Door is Closed: State is Not Charging:")
-        img = cv2.resize(img, (img.shape[1] * 2, img.shape[0] * 2))
-        cv2.imwrite("closed_image.jpg", img)
-        logger.info("Garage Closed image saved:")
-        return
+            logger.info(f"Garage Door Closed: State is Not Charging:")
+    else:
+        logger.info("Garage Door Open:")
 
-    logger.info("Garage Door is Open, Searching for contours:")
-    edged = cv2.Canny(blurred, 100, 250)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 60))
-    dilated = cv2.dilate(edged, kernel, iterations=2)
-    closing = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
-    contours, hierarchy = cv2.findContours(
-        closing, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = [c for c in contours if cv2.contourArea(c) > min_area]
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
 
-    logger.info(f"Found {len(contours)} relevant contours")
+        # Apply adaptive thresholding
+        thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 11, 2)
 
-    for contour in contours:
-        contour_area = cv2.contourArea(contour)
-        logger.info(f"Contour Area: {contour_area}")
-        if min_area < contour_area < max_area:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (morph_kernel_width, morph_kernel_height))
+        closing = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        cv2.imwrite("thresh_and_morph.jpg", closing)
+
+        contours, hierarchy = cv2.findContours(
+            closing, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
+            area = w * h
             aspect_ratio = w / h
-            logger.debug(f"Aspect Ratio: {aspect_ratio}")
-            if 1 < aspect_ratio < 10:
-                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                if img[y:y + h, x:x + w].mean() > 200:
-                    logger.info("Charging!")
-                else:
-                    logger.info("Not Charging!")
-            else:
-                logger.info("Charger not found!")
-        else:
-            logger.info(
-                "Contour area does not fall within expected range for the charger.")
+            logger.debug(
+                f"Contour found at ({x}, {y}) with area: {area} and aspect ratio: {aspect_ratio}")
 
-    # Resize and then save images for analysis
-    edged = cv2.resize(closing, (closing.shape[1] * 2, closing.shape[0] * 2))
-    img = cv2.resize(img, (img.shape[1] * 2, img.shape[0] * 2))
-    cv2.imwrite("contours.jpg", edged)
-    cv2.imwrite("final_image.jpg", img)
+            # Add vertical position check (assuming y=0 is the top)
+            vertical_threshold = int(
+                0.50 * img.shape[0])  # adjust as necessary
+
+            if (min_area <= area <= max_area and
+                aspect_ratio_range[0] <= aspect_ratio <= aspect_ratio_range[1] and
+                    y > vertical_threshold):  # Only consider contours below this threshold
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                logger.info("Possible charger detected!")
+
+        closing_resized = cv2.resize(
+            closing, (closing.shape[1] * 2, closing.shape[0] * 2))
+        img = cv2.resize(img, (img.shape[1] * 2, img.shape[0] * 2))
+
+        cv2.imwrite("contours.jpg", closing_resized)
+        cv2.imwrite("final_image.jpg", img)
 
 
 if __name__ == "__main__":
@@ -111,10 +121,17 @@ if __name__ == "__main__":
     charging_lower_bound = float(config['DEFAULT']['charging_lower_bound'])
     charging_upper_bound = float(config['DEFAULT']['charging_upper_bound'])
     image_interval = int(config['DEFAULT']['image_interval'])
+    aspect_ratio_range = tuple(map(float, config['DEFAULT'].get(
+        'aspect_ratio_range', '2.2,2.6').split(',')))
     log_level_str = config['DEFAULT'].get('log_level', 'INFO')
+    morph_kernel_width = int(config['DEFAULT']['morph_kernel_width'])
+    morph_kernel_height = int(config['DEFAULT']['morph_kernel_height'])
+    image_url_str = config['DEFAULT'].get('image_url')
+
     logger = setup_logger(log_level=log_level_str)
 
     while True:
-        fetch_and_analyze_image(
-            min_area, max_area, brightness_threshold, charging_lower_bound, charging_upper_bound)
+        fetch_and_analyze_image(image_url_str, min_area, max_area, brightness_threshold,
+                                charging_lower_bound, charging_upper_bound, aspect_ratio_range,
+                                morph_kernel_width, morph_kernel_height)
         time.sleep(image_interval)
